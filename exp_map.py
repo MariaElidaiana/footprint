@@ -4,19 +4,51 @@ from astropy.io import ascii
 import astropy.coordinates as coord
 import astropy.units as u
 import ephem
+import pandas
+import psycopg2
+from astropy.table import Table
+import healpy as hp
 
-def make_exp_map(data_file='decam_exposures_i_min30sec_Sep2016.csv',
-                 title='DECam i-band sky coverage as of September 2016',
-                 color=plt.cm.Blues,
+def teffcut(band):
+    if band == 'u' or band == 'g':
+        return 0.2
+    else:
+        return 0.3
+
+def read_file(data_file):
+    df = pandas.read_csv(data_file,index_col=[0])
+    return df
+
+def make_exp_map(data_frame=None,
+                 data_file=None,
+                 title=None,
+                 color=plt.cm.Purples,
+                 band=None,
                  out_file='test.pdf',
-                 ra_in_degrees=True,
-                 width_of_mw_band=10.):
+                 show_ra_labels_in_hours=False,
+                 width_of_mw_band=10.,
+                 color_of_mw_band='k',
+                 minteff=0.,
+                 minexptime=0.,
+                 mintilings=1):
 
-    data = ascii.read(data_file,header_start=0)
-    ra = coord.Angle(data['ra'].filled(np.nan)*u.degree)
+    if data_file is None:
+        data = Table.from_pandas(data_frame)  
+    else:
+        data = Table.from_pandas(pandas.read_csv(data_file,index_col=[0]))
+
+    if band is None:
+        idx = (data['teff']>=minteff) & (data['exptime']>=minexptime)  
+        label = 'total exposure [log (exptime/sec)]'
+    else:
+        idx = (data['teff']>=minteff) & (data['exptime']>=minexptime) & (data['band']==band) 
+        label = 'total '+band+'-band exposure [log (exptime/sec)]'
+        
+    ra = coord.Angle(data[idx]['radeg']*u.degree)
+    dec = coord.Angle(data[idx]['decdeg']*u.degree)
+    exptime = data[idx]['exptime']
+    
     ra = ra.wrap_at(180*u.degree)
-    dec = coord.Angle(data['dec'].filled(np.nan)*u.degree)
-    exptime = data['exptime'].filled(np.nan)
 
     fig = plt.figure(figsize=(8,6))
     ax = fig.add_subplot(111, projection="mollweide")
@@ -24,11 +56,11 @@ def make_exp_map(data_file='decam_exposures_i_min30sec_Sep2016.csv',
     hb=ax.hexbin(ra.radian, dec.radian, C=exptime, gridsize=npix_ra, bins='log',
                  reduce_C_function=np.sum,cmap=color)
     cb=fig.colorbar(hb,orientation='horizontal',cax=fig.add_axes([0.2, 0.17, 0.6, 0.03]))
-    cb.set_label('total exposure [log (exptime/sec)]')
-    ax.set_title(title+'\n')
+    cb.set_label(label)
+    if title is not None: ax.set_title(title+'\n')
     ax.set_xlabel('RA')
     ax.set_ylabel('DEC')
-    if not ra_in_degrees:
+    if show_ra_labels_in_hours:
         ax.set_xticklabels(['14h','16h','18h','20h','22h','0h','2h','4h','6h','8h','10h'])
     ax.grid(True)
 
@@ -39,19 +71,22 @@ def make_exp_map(data_file='decam_exposures_i_min30sec_Sep2016.csv',
         dec = coord.Angle(dec_MW[i]*u.degree)
         slices = unlink_wrap(ra.radian)
         for slc in slices:
-            ax.plot(ra.radian[slc],dec.radian[slc],'b',lw=2)        
+            ax.plot(ra.radian[slc],dec.radian[slc],color=color_of_mw_band,lw=2)        
 
 #    ra_fields_hours={'F1': 10, 'F2': 16, 'F3': 22}
 #    ra_fields_degrees={'F1': 150, 'F2': -120, 'F3': -30}
 #    dec_fields_degrees={'F1': -15, 'F2': -15, 'F3': -15}
-    ra_fields = np.array([150.,-120.,-30.])
-    dec_fields = np.array([-15.,-15.,-15.])
-    ra = coord.Angle(ra_fields*u.degree)
-    ra = ra.wrap_at(180*u.degree)
-    dec = coord.Angle(dec_fields*u.degree)
-    ax.scatter(ra.radian,dec.radian,s=100,color='red',marker='D')
+#    ra_fields = np.array([150.,-120.,-30.])
+#    dec_fields = np.array([-15.,-15.,-15.])
+#    ra = coord.Angle(ra_fields*u.degree)
+#    ra = ra.wrap_at(180*u.degree)
+#    dec = coord.Angle(dec_fields*u.degree)
+#    ax.scatter(ra.radian,dec.radian,s=100,color='red',marker='D')
 
     fig.savefig(out_file)
+#    fig.show()
+
+    return coverage_fraction(data[idx]['radeg'],data[idx]['decdeg'],data[idx]['exptime'],mintilings*minexptime)
 
 
 def the_galaxy_in_equatorial_coords(width=0.):
@@ -87,26 +122,86 @@ def unlink_wrap(dat, lims=[-np.pi, np.pi], thresh = 0.95):
         lasti = ind + 1
     yield slice(lasti, len(dat))
 
+def bands():
+    filters=['u','g','r','i','z','Y','VR']
+
+    colormaps={'u': plt.cm.Blues,
+               'g': plt.cm.Greens,
+               'r': plt.cm.Oranges,
+               'i': plt.cm.Reds,
+               'z': plt.cm.Greys,
+               'Y': plt.cm.Purples,
+               'VR': plt.cm.Purples}
+
+    coverage={'u': 0.,
+              'g': 0.,
+              'r': 0.,
+              'i': 0.,
+              'z': 0.,
+              'Y': 0.,
+              'VR': 0.}
+
+    return filters, colormaps, coverage
+
+
+def get_exp_info(outfile=None,minexptime=29.999,minteff=0.,test=False,limit=10,verbose=False):
+
+    columns = """id as EXPNUM,
+       TO_CHAR(date - '12 hours'::INTERVAL, 'YYYYMMDD') AS NITE,
+       EXTRACT(EPOCH FROM date - '1858-11-17T00:00:00Z')/(24*60*60) AS MJD_OBS,
+       ra AS RADEG,
+       declination AS DECDEG,
+       filter AS BAND,
+       exptime AS EXPTIME,
+       propid AS PROPID,
+       qc_teff AS TEFF,
+       object as OBJECT"""
+
+    table = "exposure.exposure"
+
+    criteria = "exptime>"+str(minexptime)+" and qc_teff>"+str(minteff)+" and flavor='object' "
+
+    query = "SELECT "+columns+"\nFROM "+table+"\nWHERE "+criteria 
+
+    if test : query = query + "\nLIMIT "+str(limit)
+
+    if verbose : print query
+
+    conn =  psycopg2.connect(database='decam_prd',
+                             user='decam_reader',
+                             host='des61.fnal.gov',
+                             password='reader',
+                             port=5443)
+    exposures = pandas.read_sql(query, conn)
+    conn.close()
+
+    if outfile is not None: exposures.to_csv(outfile)
+
+    return exposures
 
 
 
-filters=['g','r','i','z','VR']
+def coverage_fraction(radeg,decdeg,exptime,minexptime):
 
-colormaps={'g': plt.cm.Greens,
-           'r': plt.cm.Oranges,
-           'i': plt.cm.Purples,
-           'z': plt.cm.Greys,
-           'VR': plt.cm.Blues}
+    nside = 32
+    phi = np.radians(radeg)
+    theta = np.radians(decdeg+90)
+    npix = hp.nside2npix(nside)
+    sky = np.zeros(npix)
+
+    for idx in range(exptime.size):
+        pix = hp.ang2pix(nside, theta[idx], phi[idx])
+        sky[pix] += exptime[idx]
 
 
+    visible_fraction = 0.65
 
-for b in filters:
-    make_exp_map(data_file='decam_exposures_'+b+'_min30sec_Sep2016.csv',
-                 title='DECam '+b+'-band sky coverage as of September 2016',
-                 color=colormaps[b],
-                 out_file='map_'+b+'_h.pdf',
-                 ra_in_degrees=False,
-                 width_of_mw_band=20.)
+    pix_fraction = 1. #3./hp.nside2pixarea(32, degrees=True)
+
+    npix_covered = np.where(sky>=minexptime)[0].size
+
+    return pix_fraction * npix_covered / (visible_fraction * npix)
+
 
 
 
